@@ -1,41 +1,13 @@
-/*
- * Copyright (c) 2017, Linaro Limited
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
-
 #include <err.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 /* OP-TEE TEE client API (built by optee_client) */
 #include <tee_client_api.h>
 
-/* TA API: UUID and command IDs */
+/* To the the UUID (found the the TA's h-file(s)) */
 #include <basictee_ta.h>
-
-#define TEST_OBJECT_SIZE	10
 
 #define AES_TEST_BUFFER_SIZE	10
 #define AES_TEST_KEY_SIZE	16
@@ -44,7 +16,7 @@
 #define DECODE			0
 #define ENCODE			1
 
-/* TEE resources */
+
 struct test_ctx {
 	TEEC_Context ctx;
 	TEEC_Session sess;
@@ -75,8 +47,55 @@ void terminate_tee_session(struct test_ctx *ctx)
 	TEEC_FinalizeContext(&ctx->ctx);
 }
 
+
 /*
-*	LOAD-STORE data
+*	PRODUCE RANDOM data
+*/
+void produce_random_value(struct test_ctx *ctx, char random_uuid_value[])
+{
+	TEEC_Result res;
+	TEEC_Operation op = { 0 };
+	char random_uuid[16] = { 0 };
+	// char random_uuid_value[16];
+	uint32_t err_origin;
+	int i;
+
+	memset(&op, 0, sizeof(op));
+
+	/*
+	 * Prepare the argument. Pass a value in the first parameter,
+	 * the remaining three parameters are unused.
+	 */
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT,
+					 TEEC_NONE, TEEC_NONE, TEEC_NONE);
+	op.params[0].tmpref.buffer = random_uuid;
+	op.params[0].tmpref.size = sizeof(random_uuid);
+
+	/*
+	 * TA_EXAMPLE_RANDOM_GENERATE is the actual function in the TA to be
+	 * called.
+	 */
+	printf("Invoking TA to generate random UUID... \n");
+	res = TEEC_InvokeCommand(&ctx->sess, TA_RANDOM_CMD_GENERATE, &op, &err_origin);
+
+	if (res != TEEC_SUCCESS)
+		errx(1, "TEEC_InvokeCommand failed with code 0x%x origin 0x%x",
+			res, err_origin);
+
+	printf("TA generated UUID value = 0x");
+	for (i = 0; i < 16; i++)
+	{
+		printf("%x", random_uuid[i]);
+		random_uuid_value[i] = random_uuid[i];
+	}
+	
+	printf("\n");
+}
+
+
+
+/*
+*	READ-WRITE-DELETE data
 */
 
 TEEC_Result read_secure_object(struct test_ctx *ctx, char *id,
@@ -177,6 +196,9 @@ TEEC_Result delete_secure_object(struct test_ctx *ctx, char *id)
 	return res;
 }
 
+#define TEST_OBJECT_SIZE	10
+
+
 /*
 *	ENCRYPT-DECRYPT data
 */
@@ -266,11 +288,9 @@ void cipher_buffer(struct test_ctx *ctx, char *in, char *out, size_t sz)
 			res, origin);
 }
 
-
-int main(int argc, char *argv[])
+int main( int argc, char *argv[] )
 {
 	struct test_ctx ctx;
-	
 
 	if(argc == 1)
 	{
@@ -279,19 +299,15 @@ int main(int argc, char *argv[])
 	}
 	else
 	{
+
 		printf("Prepare session with the TA\n");
 		prepare_tee_session(&ctx);
-		
-		TEEC_Result res;
 
-		/*
-		* 1) Retrieve the old resource key
-		*/
+		TEEC_Result res;
 
 		if( strcmp(argv[1], "store") == 0 )
 		{
 			// STORE
-			printf("\n %s \n", "- Store key.");
 			res = write_secure_object(&ctx, argv[2], argv[3], sizeof(argv[3]));
 			if (res != TEEC_SUCCESS)
 				errx(1, "Failed to create/load an object");
@@ -303,7 +319,7 @@ int main(int argc, char *argv[])
 			char obj1_data[TEST_OBJECT_SIZE];
 			res = read_secure_object(&ctx, argv[2], obj1_data, sizeof(obj1_data));
 			if (res != TEEC_SUCCESS && res != TEEC_ERROR_ITEM_NOT_FOUND)
-				errx(1, "Unexpected status when reading an object : 0x%x", res);
+					errx(1, "Unexpected status when reading an object : 0x%x", res);
 			if (res == TEEC_ERROR_ITEM_NOT_FOUND) 
 			{
 				char data[] = "This is data stored in the secure storage.\n";
@@ -311,18 +327,41 @@ int main(int argc, char *argv[])
 
 			} 
 			else
-				printf( "\n Existing kresource: %s \n", obj1_data );
+				printf( " %s \n", obj1_data );
 
 		}
-		else if( strcmp(argv[1], "step3") == 0 )
+		else if( strcmp(argv[1], "encrypt") == 0 )
 		{
-			printf("\n %s \n", "- Step 3.dd");
-			
-			
+			char iv[TEST_OBJECT_SIZE];
+			char ciph[TEST_OBJECT_SIZE];
 
+			prepare_aes(&ctx, ENCODE);
+			set_key(&ctx, argv[2], AES_TEST_KEY_SIZE );
+			memset(iv, 0, sizeof(iv)); /* Load some dummy value */
+			set_iv(&ctx, iv, AES_BLOCK_SIZE);
+			cipher_buffer(&ctx, argv[3], ciph, AES_TEST_BUFFER_SIZE);
+
+			printf(" Cipher is: %s \n", ciph);
 		}
-
+		else if( strcmp(argv[1], "decrypt") == 0 )
+		{
+			char iv[TEST_OBJECT_SIZE];
+			char temp[TEST_OBJECT_SIZE];
+			
+			prepare_aes(&ctx, DECODE);
+			set_key(&ctx, argv[2], AES_TEST_KEY_SIZE );
+			memset(iv, 0, sizeof(iv)); /* Load some dummy value */
+			set_iv(&ctx, iv, AES_BLOCK_SIZE);
+			cipher_buffer(&ctx, argv[3], temp, AES_TEST_BUFFER_SIZE);
+			
+			printf(" Text is: %s \n", temp);
+		}
+		
 		terminate_tee_session(&ctx);
 	}
+	
+	
+	// ------------------------------------------------------------------------
+
 	return 0;
 }

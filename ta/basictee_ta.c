@@ -1,38 +1,15 @@
-/*
- * Copyright (c) 2017, Linaro Limited
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
+#include <inttypes.h>
 
-#include <basictee_ta.h>
 #include <tee_internal_api.h>
 #include <tee_internal_api_extensions.h>
+
+#include <basictee_ta.h>
 
 #define AES128_KEY_BIT_SIZE		128
 #define AES128_KEY_BYTE_SIZE		(AES128_KEY_BIT_SIZE / 8)
 #define AES256_KEY_BIT_SIZE		256
 #define AES256_KEY_BYTE_SIZE		(AES256_KEY_BIT_SIZE / 8)
+
 
 /* 
 *	------------------------------------------------------------------------- READ-WRITE-DELETE data
@@ -161,6 +138,9 @@ static TEE_Result read_raw_object(uint32_t param_types, TEE_Param params[4])
 	char *data;
 	size_t data_sz;
 
+	/*
+	 * Safely get the invocation parameters
+	 */
 	if (param_types != exp_param_types)
 		return TEE_ERROR_BAD_PARAMETERS;
 
@@ -174,6 +154,10 @@ static TEE_Result read_raw_object(uint32_t param_types, TEE_Param params[4])
 	data = (char *)params[1].memref.buffer;
 	data_sz = params[1].memref.size;
 
+	/*
+	 * Check the object exist and can be dumped into output buffer
+	 * then dump it.
+	 */
 	res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
 					obj_id, obj_id_sz,
 					TEE_DATA_FLAG_ACCESS_READ |
@@ -192,6 +176,10 @@ static TEE_Result read_raw_object(uint32_t param_types, TEE_Param params[4])
 	}
 
 	if (object_info.dataSize > data_sz) {
+		/*
+		 * Provided buffer is too short.
+		 * Return the expected size together with status "short buffer"
+		 */
 		params[1].memref.size = object_info.dataSize;
 		res = TEE_ERROR_SHORT_BUFFER;
 		goto exit;
@@ -212,6 +200,7 @@ exit:
 	TEE_Free(obj_id);
 	return res;
 }
+
 
 /* 
 *	-------------------------------------------------------------------------  ENCRYPT-DECRYPT data
@@ -304,6 +293,13 @@ static TEE_Result alloc_resources(void *session, uint32_t param_types,
 	if (res != TEE_SUCCESS)
 		return res;
 
+	/*
+	 * Ready to allocate the resources which are:
+	 * - an operation handle, for an AES ciphering of given configuration
+	 * - a transient object that will be use to load the key materials
+	 *   into the AES ciphering operation.
+	 */
+
 	/* Free potential previous operation */
 	if (sess->op_handle != TEE_HANDLE_NULL)
 		TEE_FreeOperation(sess->op_handle);
@@ -333,6 +329,15 @@ static TEE_Result alloc_resources(void *session, uint32_t param_types,
 		goto err;
 	}
 
+	/*
+	 * When loading a key in the cipher session, set_aes_key()
+	 * will reset the operation and load a key. But we cannot
+	 * reset and operation that has no key yet (GPD TEE Internal
+	 * Core API Specification – Public Release v1.1.1, section
+	 * 6.2.5 TEE_ResetOperation). In consequence, we will load a
+	 * dummy key in the operation so that operation can be reset
+	 * when updating the key.
+	 */
 	key = TEE_Malloc(sess->key_size, 0);
 	if (!key) {
 		res = TEE_ERROR_OUT_OF_MEMORY;
@@ -495,40 +500,67 @@ void TA_DestroyEntryPoint(void)
 }
 
 TEE_Result TA_OpenSessionEntryPoint(uint32_t __unused param_types,
-				    TEE_Param __unused params[4],
-				    void __unused **session)
+					TEE_Param __unused params[4],
+					void __unused **session)
 {
-	/* Nothing to do */
+	struct aes_cipher *sess;
+
+	/*
+	 * Allocate and init ciphering materials for the session.
+	 * The address of the structure is used as session ID for
+	 * the client.
+	 */
+	sess = TEE_Malloc(sizeof(*sess), 0);
+	if (!sess)
+		return TEE_ERROR_OUT_OF_MEMORY;
+
+	sess->key_handle = TEE_HANDLE_NULL;
+	sess->op_handle = TEE_HANDLE_NULL;
+
+	*session = (void *)sess;
+	DMSG("Session %p: newly allocated", *session);
+
 	return TEE_SUCCESS;
 }
 
-void TA_CloseSessionEntryPoint(void __unused *session)
+void TA_CloseSessionEntryPoint(void *session)
 {
-	/* Nothing to do */
+	struct aes_cipher *sess;
+
+	/* Get ciphering context from session ID */
+	DMSG("Session %p: release session", session);
+	sess = (struct aes_cipher *)session;
+
+	/* Release the session resources */
+	if (sess->key_handle != TEE_HANDLE_NULL)
+		TEE_FreeTransientObject(sess->key_handle);
+	if (sess->op_handle != TEE_HANDLE_NULL)
+		TEE_FreeOperation(sess->op_handle);
+	TEE_Free(sess);
 }
 
-TEE_Result TA_InvokeCommandEntryPoint(void __unused *session,
-				      uint32_t command,
-				      uint32_t param_types,
-				      TEE_Param params[4])
+TEE_Result TA_InvokeCommandEntryPoint(void *session,
+					uint32_t cmd,
+					uint32_t param_types,
+					TEE_Param params[4])
 {
-	switch (command) {
-	case TA_SECURE_STORAGE_CMD_WRITE_RAW:
-		return create_raw_object(param_types, params);
-	case TA_SECURE_STORAGE_CMD_READ_RAW:
-		return read_raw_object(param_types, params);
-	case TA_SECURE_STORAGE_CMD_DELETE:
-		return delete_object(param_types, params);
-	case TA_AES_CMD_PREPARE:
-		return alloc_resources(session, param_types, params);
-	case TA_AES_CMD_SET_KEY:
-		return set_aes_key(session, param_types, params);
-	case TA_AES_CMD_SET_IV:
-		return reset_aes_iv(session, param_types, params);
-	case TA_AES_CMD_CIPHER:
-		return cipher_buffer(session, param_types, params);	
-	default:
-		EMSG("Command ID 0x%x is not supported", command);
-		return TEE_ERROR_NOT_SUPPORTED;
+	switch (cmd) {
+		case TA_SECURE_STORAGE_CMD_WRITE_RAW:
+			return create_raw_object(param_types, params);
+		case TA_SECURE_STORAGE_CMD_READ_RAW:
+			return read_raw_object(param_types, params);
+		case TA_SECURE_STORAGE_CMD_DELETE:
+			return delete_object(param_types, params);
+		case TA_AES_CMD_PREPARE:
+			return alloc_resources(session, param_types, params);
+		case TA_AES_CMD_SET_KEY:
+			return set_aes_key(session, param_types, params);
+		case TA_AES_CMD_SET_IV:
+			return reset_aes_iv(session, param_types, params);
+		case TA_AES_CMD_CIPHER:
+			return cipher_buffer(session, param_types, params);
+		default:
+			EMSG("Command ID 0x%x is not supported", cmd);
+			return TEE_ERROR_NOT_SUPPORTED;
 	}
 }
